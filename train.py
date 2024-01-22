@@ -4,6 +4,7 @@ import torch
 from models.model import ModelCLR
 from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
+import torch.nn as nn
 from loss.nt_xent import NTXentLoss
 import numpy as np
 import os
@@ -12,6 +13,7 @@ import sys
 from tqdm import tqdm
 from transformers import AdamW
 from transformers import AutoTokenizer
+import torch.distributed as dist
 import logging
 logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -32,7 +34,7 @@ torch.manual_seed(0)
 
 def _save_config_file(model_checkpoints_folder):
     if not os.path.exists(model_checkpoints_folder):
-        os.makedirs(model_checkpoints_folder)
+        os.makedirs(model_checkpoints_folder, exist_ok=True)
         shutil.copy('./config.yaml', os.path.join(model_checkpoints_folder, 'config.yaml'))
 
 class SimCLR(object):
@@ -43,7 +45,7 @@ class SimCLR(object):
         self.dataset = dataset
         self.nt_xent_criterion = NTXentLoss(self.device, config['batch_size'], **config['loss'])
         self.truncation = config['truncation']
-        self.tokenizer = AutoTokenizer.from_pretrained(config['model']['bert_base_model'])#, do_lower_case=config['model_bert']['do_lower_case'])
+        self.tokenizer = AutoTokenizer.from_pretrained(config['model']['bert_base_model'])#, do_lower_case=config['model_bert']['do_lower_case']
 
     def _get_device(self):
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -74,6 +76,8 @@ class SimCLR(object):
             model, optimizer = amp.initialize(model, optimizer,
                                               opt_level='O2',
                                               keep_batchnorm_fp32=True)
+            
+        model =nn.parallel.DistributedDataParallel(model, device_ids=[self.config['gpu']], find_unused_parameters=True)
 
         #Checkpoint folder
         model_checkpoints_folder = os.path.join(self.writer.log_dir, 'checkpoints')
@@ -89,6 +93,7 @@ class SimCLR(object):
 
         for epoch_counter in range(self.config['epochs']):
             print(f'Epoch {epoch_counter}')
+            model.train()
             for xis, xls in tqdm(train_loader):
 
                 optimizer.zero_grad()
@@ -133,7 +138,12 @@ class SimCLR(object):
                 if valid_loss < best_valid_loss:
                     # save the model weights
                     best_valid_loss = valid_loss
-                    torch.save(model.state_dict(), os.path.join(model_checkpoints_folder, 'model.pth'))
+                    if self.config['rank'] == 0:
+                        torch.save({'epoch': epoch_counter, 
+                                    'model_state_dict': model.state_dict(), 
+                                    'optimizer_state_dict': optimizer.state_dict(), 
+                                    'best_valid_loss': best_valid_loss}, 
+                                    os.path.join(model_checkpoints_folder, 'model.pth'))
                 self.writer.add_scalar('validation_loss', valid_loss, global_step=valid_n_iter)
                 valid_n_iter += 1
 
@@ -177,6 +187,12 @@ class SimCLR(object):
                 valid_loss += loss.item()
                 counter += 1
             valid_loss /= counter
+        # 将损失从所有进程中收集起来
+        total_valid_loss = torch.tensor(valid_loss).to(self.device)
+        dist.all_reduce(total_valid_loss, op=dist.ReduceOp.SUM)
+        total_valid_loss /= dist.get_world_size()  # 计算平均损失
+
+
         model.train()
         # model_bert.train()
         return valid_loss

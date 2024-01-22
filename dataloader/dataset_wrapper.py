@@ -1,13 +1,12 @@
 import numpy as np
-from torch.utils.data import DataLoader
-from torch.utils.data.sampler import SubsetRandomSampler
+from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
 import torchvision.transforms as transforms
 from dataloader.gaussian_blur import GaussianBlur
 from torchvision import datasets
 from .dataset import ClrDataset
 
 np.random.seed(0)
-
 
 class DataSetWrapper(object):
     def __init__(self, 
@@ -71,16 +70,21 @@ class DataSetWrapper(object):
 
     def get_train_validation_data_loaders(self, train_dataset):
         # obtain training indices that will be used for validation
+        np.random.seed(42)
         num_train = len(train_dataset)
         indices = list(range(num_train))
         np.random.shuffle(indices)
 
-        split = int(np.floor(self.valid_size * num_train))
+        split = int(np.floor(self.valid_size))
         train_idx, valid_idx = indices[split:], indices[:split]
+        
+        train_sub_dataset = Subset(train_dataset, train_idx)
+        valid_sub_dataset = Subset(train_dataset, valid_idx)
 
         # define samplers for obtaining training and validation batches
-        train_sampler = SubsetRandomSampler(train_idx)
-        valid_sampler = SubsetRandomSampler(valid_idx)
+        train_sampler = DistributedSampler(train_sub_dataset, shuffle=True)
+        valid_sampler = DistributedSampler(valid_sub_dataset, shuffle=False)
+
 
         train_loader = DataLoader(train_dataset, batch_size=self.batch_size, sampler=train_sampler,
                                   num_workers=self.num_workers, drop_last=True, shuffle=False)
