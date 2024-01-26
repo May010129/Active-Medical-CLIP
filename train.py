@@ -20,15 +20,16 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import sys, os
 
-apex_support = False
-try:
-    sys.path.append('./apex')
-    from apex import amp
+# apex_support = False
+# try:
+#     sys.path.append('./apex')
+#     from apex import amp
 
-    apex_support = True
-except:
-    print("Please install apex for mixed precision training from: https://github.com/NVIDIA/apex")
-    apex_support = False
+#     apex_support = True
+# except:
+#     print("Please install apex for mixed precision training from: https://github.com/NVIDIA/apex")
+#     apex_support = False
+from torch.cuda.amp import autocast, GradScaler
 
 torch.manual_seed(0)
 
@@ -46,6 +47,7 @@ class SimCLR(object):
         self.nt_xent_criterion = NTXentLoss(self.device, config['batch_size'], **config['loss'])
         self.truncation = config['truncation']
         self.tokenizer = AutoTokenizer.from_pretrained(config['model']['bert_base_model'])#, do_lower_case=config['model_bert']['do_lower_case']
+        self.scaler = GradScaler()
 
     def _get_device(self):
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -72,10 +74,10 @@ class SimCLR(object):
         # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5)
 
 
-        if apex_support and self.config['fp16_precision']:
-            model, optimizer = amp.initialize(model, optimizer,
-                                              opt_level='O2',
-                                              keep_batchnorm_fp32=True)
+        # if apex_support and self.config['fp16_precision']:
+        #     model, optimizer = amp.initialize(model, optimizer,
+        #                                       opt_level='O2',
+        #                                       keep_batchnorm_fp32=True)
             
         model =nn.parallel.DistributedDataParallel(model, device_ids=[self.config['gpu']], find_unused_parameters=True)
 
@@ -99,36 +101,32 @@ class SimCLR(object):
                 optimizer.zero_grad()
                 # optimizer_bert.zero_grad()
 
-                xls = self.tokenizer(list(xls), 
-                                    return_tensors="pt", 
-                                    padding=True, 
-                                    truncation=self.truncation)
+                with autocast():
+                    xls = self.tokenizer(list(xls), 
+                                         return_tensors="pt", 
+                                         padding=True, 
+                                         truncation=self.truncation)
 
-                xis = xis.to(self.device)
-                xls = xls.to(self.device)
+                    xis = xis.to(self.device)
+                    xls = xls.to(self.device)
 
-                # get the representations and the projections
-                zis, zls = model(xis, xls)  # [N,C]
+                    # get the representations and the projections
+                    zis, zls = model(xis, xls)
 
-                # get the representations and the projections
-                # zls = model_bert(xls)  # [N,C]
-                # zls = xls
-                # normalize projection feature vectors
-
-                loss = self.nt_xent_criterion(zis, zls)
+                    loss = self.nt_xent_criterion(zis, zls)
 
                 # loss = self._step(model_res, model_bert, xis, xls, n_iter)
 
                 if n_iter % self.config['log_every_n_steps'] == 0:
                     self.writer.add_scalar('train_loss', loss, global_step=n_iter)
 
-                if apex_support and self.config['fp16_precision']:
-                    with amp.scale_loss(loss, optimizer) as scaled_loss:
-                        scaled_loss.backward()
-                else:
-                    loss.backward()
-
-                optimizer.step()
+                # if apex_support and self.config['fp16_precision']:
+                #     with amp.scale_loss(loss, optimizer) as scaled_loss:
+                #         scaled_loss.backward()
+                # else:
+                self.scaler.scale(loss).backward()
+                self.scaler.step(optimizer)
+                self.scaler.update()
                 # optimizer_bert.step()
                 n_iter += 1
                 
@@ -151,6 +149,11 @@ class SimCLR(object):
             if epoch_counter >= 10:
                 scheduler.step()
             self.writer.add_scalar('cosine_lr_decay', scheduler.get_lr()[0], global_step=n_iter)
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+
 
     def _load_pre_trained_weights(self, model):
         try:

@@ -9,8 +9,8 @@ import torchvision.transforms as transforms
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from apex.parallel import DistributedDataParallel as DDP
-from apex import amp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.cuda.amp import GradScaler, autocast
 
 def main():
     config = yaml.load(open("config.yaml", "r"), Loader=yaml.FullLoader)
